@@ -22,7 +22,25 @@ pub struct Socket {
     pub remote_addr: Ipv4Addr,
     pub local_port: u16,
     pub remote_port: u16,
+    pub send_param: SendParam,
+    pub recv_param: RecvParam,
     pub sender: TransportSender,
+}
+
+#[derive(Clone, Debug)]
+pub struct SendParam {
+    pub unacked_seq: u32, // 送信後、まだ ack されていない seq の先頭
+    pub next: u32,        // 次の送信
+    pub window: u16,      // 送信ウィンドウサイズ
+    pub initial_seq: u32, // 初期送信 seq
+}
+
+#[derive(Clone, Debug)]
+pub struct RecvParam {
+    pub next: u32,        // 次に受診する seq
+    pub window: u16,      // 受信ウィンドウサイズ
+    pub initial_seq: u32, // 初期受信 seq
+    pub tail: u32,        // 受信 seq の最後尾
 }
 
 /// まだ利用しない
