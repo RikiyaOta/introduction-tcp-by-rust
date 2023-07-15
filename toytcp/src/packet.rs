@@ -136,7 +136,7 @@ impl Debug for TCPPacket {
 impl<'a> From<TcpPacket<'a>> for TCPPacket {
     fn from(packet: TcpPacket) -> Self {
         Self {
-            buffer: packet.packet().to_vec()
+            buffer: packet.packet().to_vec(),
         }
     }
 }
