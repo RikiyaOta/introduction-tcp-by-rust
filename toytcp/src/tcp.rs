@@ -79,6 +79,145 @@ impl TCP {
 
         Ok(sock_id)
     }
+
+    /// 受信スレッド用のメソッド
+    fn receive_handler(&self) -> Result<()> {
+        dbg!("begin recv thread");
+        let (_, mut receiver) = transport::transport_channel(
+            65535,
+            // NOTE: IPアドレスが必要なので、IPパケットレベルで取得.
+            TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp),
+        )
+        .unwrap();
+        // NOTE: このイテレータに対して`next()`を呼び出すと、パケットを受信するまでスレッドをブロックして待機します。
+        let mut packet_iter = transport::ipv4_packet_iter(&mut receiver);
+        loop {
+            let (packet, remote_addr) = match packet_iter.next() {
+                Ok((p, r)) => (p, r),
+                Err(_) => continue,
+            };
+            let local_addr = packet.get_destination();
+            // pnet の TcpPacket を生成
+            let tcp_packet = match TcpPacket::new(packet.payload()) {
+                Some(p) => p,
+                None => {
+                    continue;
+                }
+            };
+            // pnet の TcpPacket から tcp::TCPPacket に変換する
+            let packet = TCPPacket::from(tcp_packet);
+            let remote_addr = match remote_addr {
+                IpAddr::V4(addr) => addr,
+                _ => {
+                    continue;
+                }
+            };
+            let mut table = self.sockets.write().unwrap();
+            let socket = match table.get_mut(&SockID(
+                local_addr,
+                remote_addr,
+                packet.get_dest(),
+                packet.get_src(),
+            )) {
+                Some(socket) => socket, // 接続済みのソケット. HashMapには接続中のソケットを記録していて、そこから見つかったわけだから。
+                None => match table.get_mut(&SockID(
+                    local_addr,
+                    UNDETERMINED_IP_ADDR,
+                    packet.get_dest(),
+                    UNDETERMINED_PORT,
+                )) {
+                    Some(socket) => socket, // リスニングソケット（とは？）
+                    None => continue,       // どのソケットにも該当しないものは無視
+                },
+            };
+
+            if !packet.is_correct_checksum(local_addr, remote_addr) {
+                dbg!("invalid checksum");
+                continue;
+            }
+
+            //let sock_id = socket.get_sock_id();
+
+            if let Err(error) = match socket.status {
+                // SYN を受け取ったということなので、応答をする必要がある。
+                TcpStatus::SynSent => self.synsent_handler(socket, &packet),
+                _ => {
+                    dbg!("not implemented state");
+                    Ok(())
+                }
+            } {
+                dbg!(error);
+            }
+        }
+    }
+
+    /// SYNSENT 状態のソケットに到着したパケットの処理
+    /// NOTE: SYN を送信した後なので、相手からSYN|ACKセグメントを受け取ればコネクションが確立され、アクティブオープンが成功.
+    fn synsent_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+        dbg!("synsent handler");
+
+        // NOTE: ここの`if`は、TCPにおけるセグメントの受診時全般に当てはまる条件を述べています。
+        // NOTE: ACK ビットは基本的にONになっている必要がある。例外はソケットがLISTEN状態の時。
+        if packet.get_flag() & tcpflags::ACK > 0
+            // NOTE: `socket.send_param.unacked_seq <= packet.get_ack() <= socket.send_param.next`: セグメントが運んでくる確認応答番号は正しい範囲内に含まれる必要があります。
+            && socket.send_param.unacked_seq <= packet.get_ack()
+            && packet.get_ack() <= socket.send_param.next
+            && packet.get_flag() & tcpflags::SYN > 0
+        {
+            socket.recv_param.next = packet.get_seq() + 1;
+            socket.recv_param.initial_seq = packet.get_seq();
+            socket.send_param.unacked_seq = packet.get_ack();
+            socket.send_param.window = packet.get_window_size();
+
+            // TODO: この条件で Established になるのってなんでだっけ？
+            // 図3.4を見たらそうなんだけど、コードのどこでunacked_seqが更新されていくのか？
+            if socket.send_param.unacked_seq > socket.send_param.initial_seq {
+                socket.status = TcpStatus::Established;
+                socket.send_tcp_packet(
+                    socket.send_param.next,
+                    socket.recv_param.next,
+                    tcpflags::ACK,
+                    &[],
+                )?;
+                dbg!("status: synsent ->", &socket.status);
+                self.publish_event(socket.get_sock_id(), TCPEventKind::ConnectionCompleted);
+            } else {
+                socket.status = TcpStatus::SynRcvd;
+                socket.send_tcp_packet(
+                    socket.send_param.next,
+                    socket.recv_param.next,
+                    tcpflags::ACK,
+                    &[],
+                )?;
+                dbg!("status: synsent ->", &socket.status);
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_event(&self, sock_id: SockID, kind: TCPEventKind) {
+        let (lock, cvar) = &self.event_condvar;
+        let mut event = lock.lock().unwrap();
+        loop {
+            if let Some(ref e) = *event {
+                if e.sock_id == sock_id && e.kind == kind {
+                    break;
+                }
+            }
+            // cvar が nofity されるまで event のロックを外して待機
+            event = cvar.wait(event).unwrap();
+        }
+        dbg!(&event);
+        *event = None;
+    }
+
+    /// 指定のソケットIDにイベントを発行する
+    fn publish_event(&self, sock_id: SockID, kind: TCPEventKind) {
+        let (lock, cvar) = &self.event_condvar;
+        let mut e = lock.lock().unwrap();
+        *e = Some(TCPEvent::new(sock_id, kind));
+        cvar.notify_all();
+    }
 }
 
 /// 宛先IPアドレスに対する送信もとインターフェースのIPアドレスを取得する。
@@ -99,4 +238,24 @@ fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr> {
     let ip = output.next().context("failed to get src ip")?;
     dbg!("source addr", ip);
     ip.parse().context("failed to parse source ip")
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TCPEvent {
+    sock_id: SockID, // イベント発生元のソケットID
+    kind: TCPEventKind,
+}
+
+impl TCPEvent {
+    fn new(sock_id: SockID, kind: TCPEventKind) -> Self {
+        Self { sock_id, kind }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TCPEventKind {
+    ConnectionCompleted,
+    Acked,
+    DataArrived,
+    ConnectionClosed,
 }

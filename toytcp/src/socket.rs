@@ -147,7 +147,7 @@ impl Socket {
         Ok(sent_size)
     }
 
-    pub fn get_sock_id(self) -> SockID {
+    pub fn get_sock_id(&self) -> SockID {
         SockID(
             self.local_addr,
             self.remote_addr,
