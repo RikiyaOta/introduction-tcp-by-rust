@@ -81,7 +81,22 @@ impl TCP {
     }
 }
 
-/// TODO: 後でハードコードしているのを変更する。
+/// 宛先IPアドレスに対する送信もとインターフェースのIPアドレスを取得する。
+/// iproute2-ss180129 で動作を確認。バージョンによって挙動が変わるかも。
 fn get_source_addr_to(addr: Ipv4Addr) -> Result<Ipv4Addr> {
-    Ok("10.0.0.1".parse().unwrap())
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ip route get {} | grep src", addr))
+        .output()?;
+    let mut output = str::from_utf8(&output.stdout)?
+        .trim()
+        .split_ascii_whitespace();
+    while let Some(s) = output.next() {
+        if s == "src" {
+            break;
+        }
+    }
+    let ip = output.next().context("failed to get src ip")?;
+    dbg!("source addr", ip);
+    ip.parse().context("failed to parse source ip")
 }
