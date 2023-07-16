@@ -321,6 +321,28 @@ impl TCP {
             .pop_front()
             .context("no connected socket")?)
     }
+
+    /// バッファのデータを順番に送信する。
+    /// 全て送信したら、まだ ack されていなくてもリターンする
+    pub fn send(&self, sock_id: SockID, buffer: &[u8]) -> Result<()> {
+        let mut cursor = 0;
+        while cursor < buffer.len() {
+            let mut table = self.sockets.write().unwrap();
+            let mut socket = table
+                .get_mut(&sock_id)
+                .context(format!("no such socket: {:?}", sock_id))?;
+            let send_size = cmp::min(MSS, buffer.len() - cursor);
+            socket.send_tcp_packet(
+                socket.send_param.next,
+                socket.recv_param.next,
+                tcpflags::ACK, // 接続済みの場合はずっと ACK フラグは立てておくのか。
+                &buffer[cursor..cursor + send_size],
+            )?;
+            cursor += send_size;
+            socket.send_param.next += send_size as u32;
+        }
+        Ok(())
+    }
 }
 
 /// 宛先IPアドレスに対する送信もとインターフェースのIPアドレスを取得する。
