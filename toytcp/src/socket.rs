@@ -24,6 +24,7 @@ pub struct Socket {
     pub remote_port: u16,
     pub send_param: SendParam,
     pub recv_param: RecvParam,
+    pub status: TcpStatus,
     pub sender: TransportSender,
 }
 
@@ -43,8 +44,34 @@ pub struct RecvParam {
     pub tail: u32,        // 受信 seq の最後尾
 }
 
-/// まだ利用しない
-pub enum TcpStatus {}
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub enum TcpStatus {
+    Listen,
+    SynSent,
+    SynRcvd,
+    Established,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    CloseWait,
+    LastAck,
+}
+
+impl Display for TcpStatus {
+    fn fmt(&self, f: &mut fmt::Formatter)  -> fmt::Result {
+        match self {
+            TcpStatus::Listen => write!(f, "LISTEN"),
+            TcpStatus::SynSent => write!(f, "SYNSENT"),
+            TcpStatus::SynRcvd => write!(f, "SYNRCVD"),
+            TcpStatus::Established => write!(f, "ESTABLISHED"),
+            TcpStatus::FinWait1 => write!(f, "FINWAIT1"),
+            TcpStatus::FinWait2 => write!(f, "FINWAIT2"),
+            TcpStatus::TimeWait => write!(f, "TIMEWAIT"),
+            TcpStatus::CloseWait => write!(f, "CLOSEWAIT"),
+            TcpStatus::LastAck => write!(f, "LASTACK"),
+        }
+    }
+}
 
 impl Socket {
     pub fn new(
