@@ -43,7 +43,7 @@ impl TCPPacket {
         ])
     }
 
-    pub fn set_seq(&mut self, num: u16) {
+    pub fn set_seq(&mut self, num: u32) {
         self.buffer[4..8].copy_from_slice(&num.to_be_bytes());
     }
 
