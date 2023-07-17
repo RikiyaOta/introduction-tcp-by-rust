@@ -3,7 +3,12 @@ use std::{env, fs, net::Ipv4Addr, str};
 use toytcp::tcp::TCP;
 
 fn main() -> Result<()> {
-    todo!()
+    let args: Vec<String> = env::args().collect();
+    let addr: Ipv4Addr = args[1].parse()?;
+    let port: u16 = args[2].parse()?;
+    let savepath: &str = &args[3];
+    file_server(addr, port, savepath)?;
+    Ok(())
 }
 
 fn file_server(local_addr: Ipv4Addr, local_port: u16, savepath: &str) -> Result<()> {
