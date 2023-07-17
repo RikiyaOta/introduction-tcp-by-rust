@@ -15,6 +15,7 @@ use std::{cmp, ops::Range, str, thread};
 const UNDETERMINED_IP_ADDR: std::net::Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
 const UNDETERMINED_PORT: u16 = 0;
 const MAX_TRANSMITTION: u8 = 5;
+// RFCでは動的にタイムアウトを設定する方法について記載しているが、ここでは定数とする。
 const RETRANSMITTION_TIMEOUT: u64 = 3;
 const MSS: usize = 1460;
 const PORT_RANGE: Range<u16> = 40000..60000;
@@ -36,6 +37,11 @@ impl TCP {
         std::thread::spawn(move || {
             // パケットの受信用スレッド
             cloned_tcp.receive_handler().unwrap();
+        });
+        let cloned_tcp = tcp.clone();
+        std::thread::spawn(move || {
+            // 再送を管理するためのタイマースレッド
+            cloned_tcp.timer();
         });
         tcp
     }
@@ -379,6 +385,55 @@ impl TCP {
             socket.send_param.next += send_size as u32;
         }
         Ok(())
+    }
+
+    /// タイマースレッド用の関数
+    /// 全てのソケットの再送キューを見て、タイムアウトしているパケットを再送する。
+    fn timer(&self) {
+        dbg!("begin timer thread");
+        loop {
+            let mut table = self.sockets.write().unwrap();
+            // 全てのソケットを順次見ていく
+            for (_, socket) in table.iter_mut() {
+                while let Some(mut item) = socket.retransmission_queue.pop_front() {
+                    // 再送キューから ack されたセグメントを除去する。
+                    // established state 以外の時に送信されたセグメントを除去するために必要
+                    if socket.send_param.unacked_seq > item.packet.get_seq() {
+                        dbg!("successfully acked", item.packet.get_seq());
+                        continue;
+                    }
+
+                    // timeout を確認
+                    if item.latest_transmission_time.elapsed().unwrap()
+                        < Duration::from_secs(RETRANSMITTION_TIMEOUT)
+                    {
+                        // timeout していないので再送キューに戻す
+                        // この時、これ以降のエントリもタイムアウトしていないと判断できるので、先頭に戻す。
+                        socket.retransmission_queue.push_front(item);
+                        break;
+                    }
+
+                    // ack されていなければ再送
+                    if item.transmission_count < MAX_TRANSMITTION {
+                        dbg!("retransmit");
+                        socket
+                            .sender
+                            .send_to(item.packet.clone(), IpAddr::V4(socket.remote_addr))
+                            .context("failed to retransmit")
+                            .unwrap();
+                        item.transmission_count += 1;
+                        item.latest_transmission_time = SystemTime::now();
+                        socket.retransmission_queue.push_back(item);
+                        break;
+                    } else {
+                        dbg!("reached MAX_TRANSMITTION");
+                    }
+                }
+            }
+            // write lock を外して待機する
+            drop(table);
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
