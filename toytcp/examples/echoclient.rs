@@ -18,7 +18,12 @@ fn main() -> Result<()> {
 fn echo_client(remote_addr: Ipv4Addr, remote_port: u16) -> Result<()> {
     let tcp = TCP::new();
     let sock_id = tcp.connect(remote_addr, remote_port)?;
-
+    let cloned_tcp = tcp.clone();
+    // Ctrl+c でクライアント側からクローズする
+    ctrlc::set_handler(move || {
+        cloned_tcp.close(sock_id).unwrap();
+        std::process::exit(0);
+    })?;
     loop {
         // connect した後に stdin で受け取った文字列を send するだけ。
         let mut input = String::new();

@@ -150,6 +150,8 @@ impl TCP {
                 // SYN を受け取ったということなので、応答をする必要がある。
                 TcpStatus::SynSent => self.synsent_handler(socket, &packet),
                 TcpStatus::Established => self.established_handler(socket, &packet),
+                TcpStatus::CloseWait | TcpStatus::LastAck => self.close_handler(socket, &packet),
+                TcpStatus::FinWait1 | TcpStatus::FinWait2 => self.finwait_handler(socket, &packet),
                 _ => {
                     dbg!("not implemented state");
                     Ok(())
@@ -196,6 +198,20 @@ impl TCP {
 
         if !packet.payload().is_empty() {
             self.process_payload(socket, &packet)?;
+        }
+
+        // パッシブクローズの処理
+        // ESTABLISHED状態の時に FIN|ACK を相手から受け取ることになるので、ここに処理を書きます。
+        if packet.get_flag() & tcpflags::FIN > 0 {
+            socket.recv_param.next = packet.get_seq() + 1;
+            socket.send_tcp_packet(
+                socket.send_param.next,
+                socket.recv_param.next,
+                tcpflags::ACK,
+                &[],
+            )?;
+            socket.status = TcpStatus::CloseWait;
+            self.publish_event(socket.get_sock_id(), TCPEventKind::DataArrived);
         }
 
         Ok(())
@@ -434,6 +450,15 @@ impl TCP {
                         // window を右にずらしている。
                         socket.send_param.window += item.packet.payload().len() as u16;
                         self.publish_event(*sock_id, TCPEventKind::Acked);
+
+                        // FIN|ACK セグメントが確認応答されたことをタイマースレッドでチェックして
+                        // ConnectionClosed イベントを投げます。
+                        if item.packet.get_flag() & tcpflags::FIN > 0
+                            && socket.status == TcpStatus::LastAck
+                        {
+                            self.publish_event(*sock_id, TCPEventKind::ConnectionClosed);
+                        }
+
                         continue;
                     }
 
@@ -461,6 +486,15 @@ impl TCP {
                         break;
                     } else {
                         dbg!("reached MAX_TRANSMITTION");
+                        // FIN|ACKセグメントを最大まで再送しても返事が返ってこない場合は、
+                        // 相手が勝手に終了している可能性があるため、その場合も ConnectionClosed イベントを投げる。
+                        if item.packet.get_flag() & tcpflags::FIN > 0
+                            && (socket.status == TcpStatus::LastAck
+                                || socket.status == TcpStatus::FinWait1
+                                || socket.status == TcpStatus::FinWait2)
+                        {
+                            self.publish_event(*sock_id, TCPEventKind::ConnectionClosed);
+                        }
                     }
                 }
             }
@@ -480,6 +514,12 @@ impl TCP {
 
         // ここのループで、読み込むデータサイズを決定する。
         while received_size == 0 {
+            // ペイロードを受信 or FIN を受信でスキップ
+            match socket.status {
+                TcpStatus::CloseWait | TcpStatus::LastAck | TcpStatus::TimeWait => break,
+                _ => {}
+            }
+
             // lock を外してイベントの待機。受診スレッドがロックを取得できるようにするため。
             drop(table);
             dbg!("waiting incoming data");
@@ -533,6 +573,95 @@ impl TCP {
             dbg!("recv buffer overflow");
         }
         self.publish_event(socket.get_sock_id(), TCPEventKind::DataArrived);
+        Ok(())
+    }
+
+    /// 接続を閉じる
+    pub fn close(&self, sock_id: SockID) -> Result<()> {
+        let mut table = self.sockets.write().unwrap();
+        let mut socket = table
+            .get_mut(&sock_id)
+            .context(format!("no such socket: {:?}", sock_id))?;
+
+        socket.send_tcp_packet(
+            socket.send_param.next,
+            socket.recv_param.next,
+            // 注意：最初に送信するときも、ACKフラグは立てておく必要がある。ここは今までと変わらず。
+            tcpflags::FIN | tcpflags::ACK,
+            &[],
+        )?;
+
+        socket.send_param.next += 1;
+        match socket.status {
+            TcpStatus::Established => {
+                socket.status = TcpStatus::FinWait1;
+                drop(table);
+                self.wait_event(sock_id, TCPEventKind::ConnectionClosed);
+                let mut table = self.sockets.write().unwrap();
+                table.remove(&sock_id);
+                dbg!("closed & removed", sock_id);
+            }
+            TcpStatus::CloseWait => {
+                socket.status = TcpStatus::LastAck;
+                drop(table);
+                self.wait_event(sock_id, TCPEventKind::ConnectionClosed);
+                let mut table = self.sockets.write().unwrap();
+                table.remove(&sock_id);
+                dbg!("closed & removed", sock_id);
+            }
+            TcpStatus::Listen => {
+                table.remove(&sock_id);
+            }
+            _ => return Ok(()),
+        }
+
+        Ok(())
+    }
+
+    /// FINWAIT1 or FINWAIT2 状態のソケットに到着したパケットの処理
+    /// これは、アクティブクローズ状態の時に受信したセグメントのハンドラになる。
+    fn finwait_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+        dbg!("finwait handler");
+        if socket.send_param.unacked_seq < packet.get_ack()
+            && packet.get_ack() <= socket.send_param.next
+        {
+            socket.send_param.unacked_seq = packet.get_ack();
+            self.delete_acked_segment_from_retransmission_queue(socket);
+        } else if socket.send_param.next < packet.get_ack() {
+            // 未送信セグメントに対するackは破棄
+            return Ok(());
+        }
+
+        if !packet.payload().is_empty() {
+            self.process_payload(socket, &packet)?;
+        }
+
+        if socket.status == TcpStatus::FinWait1
+            && socket.send_param.next == socket.send_param.unacked_seq
+        {
+            // 送信したFINがackされていればFinWait2へ遷移
+            socket.status = TcpStatus::FinWait2;
+            dbg!("status: finwait1 -> ", &socket.status);
+        }
+
+        if packet.get_flag() & tcpflags::FIN > 0 {
+            // 本来は CLOSING state も考慮する必要があるが省略
+            socket.recv_param.next += 1;
+            socket.send_tcp_packet(
+                socket.send_param.next,
+                socket.recv_param.next,
+                tcpflags::ACK,
+                &[],
+            )?;
+            self.publish_event(socket.get_sock_id(), TCPEventKind::ConnectionClosed);
+        }
+
+        Ok(())
+    }
+
+    fn close_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+        dbg!("closewait | lastack handler");
+        socket.send_param.unacked_seq = packet.get_ack();
         Ok(())
     }
 }
