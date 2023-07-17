@@ -194,6 +194,10 @@ impl TCP {
             return Ok(());
         }
 
+        if !packet.payload().is_empty() {
+            self.process_payload(socket, &packet)?;
+        }
+
         Ok(())
     }
 
@@ -495,6 +499,41 @@ impl TCP {
         socket.recv_buffer.copy_within(copy_size.., 0);
         socket.recv_param.window += copy_size as u16;
         Ok(copy_size)
+    }
+
+    /// パケットのペイロードを受信バッファにコピーする
+    fn process_payload(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+        // バッファにおける読み込みヘッドの位置
+        let offset = socket.recv_buffer.len() - socket.recv_param.window as usize
+            + (packet.get_seq() - socket.recv_param.next) as usize;
+        let copy_size = cmp::min(packet.payload().len(), socket.recv_buffer.len() - offset);
+        socket.recv_buffer[offset..offset + copy_size]
+            .copy_from_slice(&packet.payload()[..copy_size]);
+        // ロス再送の際、穴埋めされるためにmaxをとる
+        socket.recv_param.tail =
+            cmp::max(socket.recv_param.tail, packet.get_seq() + copy_size as u32);
+
+        if packet.get_seq() == socket.recv_param.next {
+            // 順序入れ替わり無しの場合のみ、recv_param.next を進める
+            socket.recv_param.next = socket.recv_param.tail;
+            socket.recv_param.window -= (socket.recv_param.tail - packet.get_seq()) as u16;
+        }
+
+        if copy_size > 0 {
+            // 受信バッファにコピーが成功
+            socket.send_tcp_packet(
+                socket.send_param.next,
+                socket.recv_param.next,
+                // 受け取りが成功したので、ACKで返すってことね。
+                tcpflags::ACK,
+                &[],
+            )?;
+        } else {
+            // 受信バッファが溢れたときはセグメントを破棄
+            dbg!("recv buffer overflow");
+        }
+        self.publish_event(socket.get_sock_id(), TCPEventKind::DataArrived);
+        Ok(())
     }
 }
 

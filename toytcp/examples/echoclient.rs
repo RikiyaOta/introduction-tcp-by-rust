@@ -24,9 +24,9 @@ fn echo_client(remote_addr: Ipv4Addr, remote_port: u16) -> Result<()> {
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         tcp.send(sock_id, input.as_bytes())?;
-        // 実験：入力した文字列を増大させて送ってみる（window が効いていることを確認するため）
-        //loop {
-        //    tcp.send(sock_id, input.repeat(2000).as_bytes())?;
-        //}
+
+        let mut buffer = vec![0; 1500];
+        let n = tcp.recv(sock_id, &mut buffer)?;
+        print!("> {}", str::from_utf8(&buffer[..n])?);
     }
 }
