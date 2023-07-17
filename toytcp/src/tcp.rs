@@ -579,7 +579,7 @@ impl TCP {
     /// 接続を閉じる
     pub fn close(&self, sock_id: SockID) -> Result<()> {
         let mut table = self.sockets.write().unwrap();
-        let mut socket = table
+        let socket = table
             .get_mut(&sock_id)
             .context(format!("no such socket: {:?}", sock_id))?;
 
