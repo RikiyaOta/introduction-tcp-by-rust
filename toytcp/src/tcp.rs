@@ -166,6 +166,7 @@ impl TCP {
             // Question: ここは、`>=`じゃダメなのだろうか？
             if socket.send_param.unacked_seq > item.packet.get_seq() {
                 dbg!("successfully acked", item.packet.get_seq());
+                socket.send_param.window += item.packet.payload().len() as u16;
                 self.publish_event(socket.get_sock_id(), TCPEventKind::Acked);
             } else {
                 // ack されていない。戻す。
@@ -374,7 +375,27 @@ impl TCP {
             let mut socket = table
                 .get_mut(&sock_id)
                 .context(format!("no such socket: {:?}", sock_id))?;
-            let send_size = cmp::min(MSS, buffer.len() - cursor);
+            //let send_size = cmp::min(MSS, buffer.len() - cursor);
+            let mut send_size = cmp::min(
+                MSS,
+                cmp::min(socket.send_param.window as usize, buffer.len() - cursor),
+            );
+            while send_size == 0 {
+                dbg!("unable to slide send window");
+                // ロックを外してイベントの待機。受診スレッドがロックを取得できるようにするため。
+                drop(table);
+                self.wait_event(sock_id, TCPEventKind::Acked);
+                table = self.sockets.write().unwrap();
+                socket = table
+                    .get_mut(&sock_id)
+                    .context(format!("no such socket: {:?}", sock_id))?;
+                // 送信サイズを再計算する
+                send_size = cmp::min(
+                    MSS,
+                    cmp::min(socket.send_param.window as usize, buffer.len() - cursor),
+                );
+            }
+            dbg!("current window size", socket.send_param.window);
             socket.send_tcp_packet(
                 socket.send_param.next,
                 socket.recv_param.next,
@@ -383,6 +404,12 @@ impl TCP {
             )?;
             cursor += send_size;
             socket.send_param.next += send_size as u32;
+            // window をスライドさせる（見た目的には window size を減らしているように見えるが、ずらしてるだけ）
+            socket.send_param.window -= send_size as u16;
+            // 少しの間ロックを外して待機して、受信スレッドがACKを受信できるようにしている。
+            // send_window が0になるまで送り続け、送信がブロックされる確率を下げるため。
+            drop(table);
+            thread::sleep(Duration::from_millis(1));
         }
         Ok(())
     }
@@ -394,12 +421,15 @@ impl TCP {
         loop {
             let mut table = self.sockets.write().unwrap();
             // 全てのソケットを順次見ていく
-            for (_, socket) in table.iter_mut() {
+            for (sock_id, socket) in table.iter_mut() {
                 while let Some(mut item) = socket.retransmission_queue.pop_front() {
                     // 再送キューから ack されたセグメントを除去する。
                     // established state 以外の時に送信されたセグメントを除去するために必要
                     if socket.send_param.unacked_seq > item.packet.get_seq() {
                         dbg!("successfully acked", item.packet.get_seq());
+                        // window を右にずらしている。
+                        socket.send_param.window += item.packet.payload().len() as u16;
+                        self.publish_event(*sock_id, TCPEventKind::Acked);
                         continue;
                     }
 
