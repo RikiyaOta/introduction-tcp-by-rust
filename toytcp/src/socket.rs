@@ -25,11 +25,18 @@ pub struct Socket {
     pub send_param: SendParam,
     pub recv_param: RecvParam,
     pub status: TcpStatus,
+
+    // 到着したデータを一度保管する。TCPセグメントは通信の途中で順番が入れ替わったり失われたり色々あるので。
+    pub recv_buffer: Vec<u8>,
+
     pub retransmission_queue: VecDeque<RetransmissionQueueEntry>,
+
     // 接続済みソケットを保持するキュー。りすにんぐそけっとのみ使用。
     pub connected_connection_euque: VecDeque<SockID>,
+
     // 生成元のリスニングソケット。接続済みソケットのみ使用。
     pub listening_socket: Option<SockID>,
+
     pub sender: TransportSender,
 }
 
@@ -112,6 +119,7 @@ impl Socket {
                 tail: 0,
             },
             status,
+            recv_buffer: vec![0; SOCKET_BUFFER_SIZE],
             retransmission_queue: VecDeque::new(),
             connected_connection_euque: VecDeque::new(),
             listening_socket: None,

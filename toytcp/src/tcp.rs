@@ -465,6 +465,37 @@ impl TCP {
             thread::sleep(Duration::from_millis(100));
         }
     }
+
+    /// データをバッファに読み込んで、読み込んだサイズを返す。FINを読み込んだ場合は0を返す。
+    pub fn recv(&self, sock_id: SockID, buffer: &mut [u8]) -> Result<usize> {
+        let mut table = self.sockets.write().unwrap();
+        let mut socket = table
+            .get_mut(&sock_id)
+            .context(format!("no such socket: {:?}", sock_id))?;
+        let mut received_size = socket.recv_buffer.len() - socket.recv_param.window as usize;
+
+        // ここのループで、読み込むデータサイズを決定する。
+        while received_size == 0 {
+            // lock を外してイベントの待機。受診スレッドがロックを取得できるようにするため。
+            drop(table);
+            dbg!("waiting incoming data");
+            self.wait_event(sock_id, TCPEventKind::DataArrived);
+            table = self.sockets.write().unwrap();
+            socket = table
+                .get_mut(&sock_id)
+                .context(format!("no such socket: {:?}", sock_id))?;
+            received_size = socket.recv_buffer.len() - socket.recv_param.window as usize;
+        }
+        let copy_size = cmp::min(buffer.len(), received_size);
+
+        // バッファーにデータを読み込む！
+        buffer[..copy_size].copy_from_slice(&socket.recv_buffer[..copy_size]);
+
+        // 読み込まなかった残りの分を先頭に移動させる。
+        socket.recv_buffer.copy_within(copy_size.., 0);
+        socket.recv_param.window += copy_size as u16;
+        Ok(copy_size)
+    }
 }
 
 /// 宛先IPアドレスに対する送信もとインターフェースのIPアドレスを取得する。
