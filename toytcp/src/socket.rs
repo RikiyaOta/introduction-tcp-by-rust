@@ -25,6 +25,7 @@ pub struct Socket {
     pub send_param: SendParam,
     pub recv_param: RecvParam,
     pub status: TcpStatus,
+    pub retransmission_queue: VecDeque<RetransmissionQueueEntry>,
     // 接続済みソケットを保持するキュー。りすにんぐそけっとのみ使用。
     pub connected_connection_euque: VecDeque<SockID>,
     // 生成元のリスニングソケット。接続済みソケットのみ使用。
@@ -111,6 +112,7 @@ impl Socket {
                 tail: 0,
             },
             status,
+            retransmission_queue: VecDeque::new(),
             connected_connection_euque: VecDeque::new(),
             listening_socket: None,
             sender,
@@ -150,6 +152,16 @@ impl Socket {
             .context(format!("failed to send: \n{:?}", tcp_packet))?;
 
         dbg!("sent", &tcp_packet);
+        // もし送信先から確認応答がこなかった場合は再送する必要がある。
+        // なので、送信直後のこのタイミングでエンキューする。
+        // ただし、ペイロードを持たないACKセグメントは再送対象にはなりません。ACKセグメントのACKセグメントというように、無限に確認応答が必要になる。
+        // 再送対象になるのは、ペイロードが存在しているか、ACKセグメントでないセグメントです。
+        // 例：SYNセグメント、SYN|ACKセグメント、ペイロードをのせたACKセグメント
+        if payload.is_empty() && tcp_packet.get_flag() == tcpflags::ACK {
+            return Ok(sent_size);
+        }
+        self.retransmission_queue
+            .push_back(RetransmissionQueueEntry::new(tcp_packet));
         Ok(sent_size)
     }
 
@@ -160,5 +172,22 @@ impl Socket {
             self.local_port,
             self.remote_port,
         )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RetransmissionQueueEntry {
+    pub packet: TCPPacket,
+    pub latest_transmission_time: SystemTime,
+    pub transmission_count: u8,
+}
+
+impl RetransmissionQueueEntry {
+    fn new(packet: TCPPacket) -> Self {
+        Self {
+            packet,
+            latest_transmission_time: SystemTime::now(),
+            transmission_count: 1,
+        }
     }
 }
